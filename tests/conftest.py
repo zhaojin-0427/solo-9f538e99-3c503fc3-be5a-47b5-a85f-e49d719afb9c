@@ -24,6 +24,9 @@ def settings(tmp_path: Path) -> Settings:
         seed_database_path=SEED,
         chunk_size=4,
         chunk_delay_ms=0,
+        # Small yield keeps the suite fast; lock-fairness regression tests use
+        # an explicit, larger value that mirrors the production default.
+        lock_yield_ms=1,
         busy_timeout_ms=10_000,
         auto_resume=False,
     )

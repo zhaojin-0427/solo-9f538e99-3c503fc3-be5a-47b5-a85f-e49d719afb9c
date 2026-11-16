@@ -9,6 +9,9 @@ services:
       SEED_DATABASE_PATH: /app/seed/lab_wide.db
       MIGRATION_CHUNK_SIZE: "${MIGRATION_CHUNK_SIZE:-100}"
       MIGRATION_CHUNK_DELAY_MS: "${MIGRATION_CHUNK_DELAY_MS:-100}"
+      # Pause (ms) between migration write transactions so a short-busy-timeout
+      # legacy connection can still acquire the single SQLite write lock.
+      MIGRATION_LOCK_YIELD_MS: "${MIGRATION_LOCK_YIELD_MS:-25}"
       SQLITE_BUSY_TIMEOUT_MS: "30000"
       AUTO_RESUME: "true"
     volumes:

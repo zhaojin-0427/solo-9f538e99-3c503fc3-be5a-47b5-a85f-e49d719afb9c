@@ -555,7 +555,7 @@ def test_externally_cut_over_database_is_not_migrated_twice(settings):
     """If samples is already a view, a POST must only record completion."""
     from app.db import connect as db_connect
     from app.migration import MigrationEngine
-    from app.schema import create_base_schema, replace_wide_table_with_view
+    from app.schema import create_base_schema, switch_wide_table_to_view
 
     eng = MigrationEngine(settings)
     eng.initialize()
@@ -573,8 +573,8 @@ def test_externally_cut_over_database_is_not_migrated_twice(settings):
             "INSERT INTO sample_metrics(sample_id, metric, value)"
             " VALUES(100,'temperature',1.0),(100,'ph',2.0)"
         )
-        db.execute("DROP TABLE samples")
-        replace_wide_table_with_view(db)
+        # An external cutover following the same archive-rename convention.
+        switch_wide_table_to_view(db)
         db.execute("COMMIT")
     finally:
         db.close()

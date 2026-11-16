@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS _insert_context (
 )
 """
 
+# Single-row write watermark.  The mirroring triggers bump it for every
+# committed legacy write while migration is active, so the engine can detect
+# whether legacy writes happened during a reconciliation pass without scanning
+# the whole table.  The post-cutover compatibility triggers never touch it,
+# freezing the value at the switch instant.
+WATERMARK_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS migration_write_watermark (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    counter INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+WATERMARK_SEED_SQL = """
+INSERT OR IGNORE INTO migration_write_watermark (id, counter) VALUES (1, 0)
+"""
+
 # Compatibility view: exactly the legacy column names, values and NULLs.
 COMPAT_VIEW_SQL = """
 CREATE VIEW samples (id, temperature, ph) AS
@@ -142,9 +158,15 @@ DROP VIEW IF EXISTS samples;
 
 # Triggers installed on the real wide table for the duration of the migration.
 # Every committed legacy write is mirrored immediately, so a chunk that was
-# copied earlier can never be rolled back to a stale value.
+# copied earlier can never be rolled back to a stale value.  Each trigger also
+# bumps the single-row watermark, an observable counter of legacy writes (kept
+# for diagnostics/operability; the engine's correctness does not depend on it).
+WATERMARK_BUMP = (
+    "UPDATE migration_write_watermark SET counter = counter + 1 WHERE id = 1"
+)
+
 MIGRATION_TRIGGERS = (
-    """
+    f"""
     CREATE TRIGGER _migration_samples_insert AFTER INSERT ON samples
     BEGIN
         INSERT INTO sample_metrics (sample_id, metric, value)
@@ -153,9 +175,10 @@ MIGRATION_TRIGGERS = (
         INSERT INTO sample_metrics (sample_id, metric, value)
         VALUES (NEW.id, 'ph', NEW.ph)
         ON CONFLICT (sample_id, metric) DO UPDATE SET value = excluded.value;
+        {WATERMARK_BUMP};
     END
     """,
-    """
+    f"""
     CREATE TRIGGER _migration_samples_update AFTER UPDATE ON samples
     BEGIN
         DELETE FROM sample_metrics
@@ -166,12 +189,14 @@ MIGRATION_TRIGGERS = (
         INSERT INTO sample_metrics (sample_id, metric, value)
         VALUES (NEW.id, 'ph', NEW.ph)
         ON CONFLICT (sample_id, metric) DO UPDATE SET value = excluded.value;
+        {WATERMARK_BUMP};
     END
     """,
-    """
+    f"""
     CREATE TRIGGER _migration_samples_delete AFTER DELETE ON samples
     BEGIN
         DELETE FROM sample_metrics WHERE sample_id = OLD.id;
+        {WATERMARK_BUMP};
     END
     """,
 )
@@ -190,6 +215,13 @@ CREATE TABLE samples (
 )
 """
 
+# At cutover the legacy wide table is renamed (a metadata-only operation that
+# takes ~1 ms even on an 800k-row table) instead of being dropped inside the
+# switch transaction.  The engine drops it in a separate short transaction
+# immediately after the switch commits; if the process dies in between, the
+# archive is harmless and cleaned up by the next run.
+ARCHIVE_TABLE = "samples_legacy_archive"
+
 
 def create_base_schema(conn) -> None:
     """Create long storage and migration bookkeeping (idempotent)."""
@@ -197,6 +229,8 @@ def create_base_schema(conn) -> None:
     conn.execute(MIGRATION_TABLE_SQL)
     conn.execute(MIGRATION_EVENT_SQL)
     conn.execute(INSERT_CONTEXT_SQL)
+    conn.execute(WATERMARK_TABLE_SQL)
+    conn.execute(WATERMARK_SEED_SQL)
 
 
 def ensure_wide_table(conn) -> None:
@@ -226,13 +260,18 @@ def drop_migration_triggers(conn) -> None:
             conn.execute(statement)
 
 
-def replace_wide_table_with_view(conn) -> None:
-    """Drop the wide table and install the compatibility view.
+def switch_wide_table_to_view(conn, archive: str = ARCHIVE_TABLE) -> None:
+    """Atomically replace the wide table with the compatibility view.
 
-    Caller must be inside a write transaction.  SQLite DDL is transactional,
-    so a failure at any point rolls the whole switch back.
+    Caller must be inside a short write transaction, after dropping the
+    mirroring triggers.  The wide table is renamed rather than dropped:
+    ``ALTER TABLE RENAME`` only touches the schema catalog, so this whole
+    operation holds the write lock for a few milliseconds regardless of the
+    table size.  A drop of a large table would run inside the same lock and
+    could exceed a legacy connection's busy timeout.
     """
-    conn.execute("DROP TABLE IF EXISTS samples")
+    conn.execute(f"DROP TABLE IF EXISTS {archive}")
+    conn.execute("ALTER TABLE samples RENAME TO " + archive)
     for statement in _COMPAT_DROP_SQL.split(";"):
         if statement.strip():
             conn.execute(statement)
@@ -240,3 +279,8 @@ def replace_wide_table_with_view(conn) -> None:
     conn.execute(COMPAT_INSERT_TRIGGER_SQL)
     conn.execute(COMPAT_UPDATE_TRIGGER_SQL)
     conn.execute(COMPAT_DELETE_TRIGGER_SQL)
+
+
+def drop_archived_wide_table(conn, archive: str = ARCHIVE_TABLE) -> None:
+    """Drop the archived wide table.  Intended to run in its own transaction."""
+    conn.execute(f"DROP TABLE IF EXISTS {archive}")

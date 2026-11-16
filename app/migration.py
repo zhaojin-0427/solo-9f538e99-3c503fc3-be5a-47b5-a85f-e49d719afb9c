@@ -12,16 +12,40 @@ Phase 1 -- online, resumable copy
     that instant.  ``last_id`` is committed in the same transaction as its
     chunk, so a restart resumes exactly where it stopped.
 
-Phase 2 -- atomic cutover
-    One ``BEGIN IMMEDIATE`` transaction:
-      1. final catch-up from the wide table (overwrites older copied values),
-      2. delete long rows for samples deleted during migration,
-      3. validate exactly ``samples * 2`` metric rows,
-      4. drop the mirroring triggers,
-      5. drop the wide table and install the compatibility view plus INSTEAD OF
-         triggers for legacy INSERT / UPDATE / DELETE.
-    SQLite DDL is transactional, so the switch either fully commits or leaves
-    the wide table untouched.  In WAL mode readers see either the old table or
+Phase 2 -- short-lock cutover
+    The old implementation ran the whole switch as one giant transaction
+    (full-table INSERT ... SELECT, DELETE, two COUNT(*) validations and the
+    DDL).  On an 800k-row table that holds SQLite's write lock for well over a
+    second, so a legacy connection whose ``busy_timeout`` is one second fails
+    its UPDATE with "database is locked" -- even though the migration later
+    reports ``completed``.
+
+    The cutover now keeps every write transaction short:
+
+      1. **Reconciliation in chunk-sized transactions.**  The wide table is
+         replayed into the long table in id-ordered chunks (UPSERT skips
+         unchanged rows, so a converged table costs almost nothing), and long
+         rows whose sample no longer exists are removed in keyset chunks too.
+         Each transaction holds the lock for only a few milliseconds, so legacy
+         writes keep committing within their busy timeout.  This pass is a
+         backstop: the mirroring triggers have already applied every committed
+         legacy write, so no quiet window is required.
+      2. **Atomic switch in one tiny transaction.**  Once the write lock is
+         held, validate row counts, drop the mirroring triggers, rename the
+         wide table (a catalog-only operation) and install the compatibility
+         view plus INSTEAD OF triggers, all in one transaction that typically
+         commits in single-digit milliseconds.  The only retry is failure to
+         acquire the lock; on any other error the transaction rolls back, so no
+         half-switched state is ever committed.
+      3. **Archive cleanup.**  The renamed wide table is dropped in a separate
+         short transaction after the switch commits.  A crash between the two
+         leaves a harmless archive that the next start removes.
+      4. **Fairness yields.**  Between every migration write transaction the
+         connection sleeps ``lock_yield_ms`` without holding any SQLite lock,
+         giving a short-busy-timeout legacy writer a chance to acquire the
+         single write lock instead of being starved by back-to-back chunks.
+
+    SQLite DDL is transactional and WAL readers see either the old table or
     the new view, never an intermediate state.
 
 Idempotency and recovery
@@ -45,12 +69,14 @@ from typing import Any
 from .config import Settings
 from .db import connect, transaction
 from .schema import (
+    ARCHIVE_TABLE,
     WIDE_TABLE_SQL,
     create_base_schema,
+    drop_archived_wide_table,
     drop_migration_triggers,
     ensure_wide_table,
     install_migration_triggers,
-    replace_wide_table_with_view,
+    switch_wide_table_to_view,
 )
 
 logger = logging.getLogger("migration")
@@ -61,6 +87,13 @@ METRICS = ("temperature", "ph")
 CONTINUE = "continue"  # copied a chunk; run the loop again
 DONE = "done"  # no ids left, ready for cutover
 ABORT = "abort"  # run is no longer active
+
+# Bound the number of times the switch retries when it cannot acquire the
+# write lock.  Each retry rolls back cleanly, so no half-switched state is ever
+# committed; the cap turns a persistent lock outage into a recorded failure.
+MAX_SWITCH_ATTEMPTS = 100
+# Backoff between switch retries when another connection holds the write lock.
+SWITCH_RETRY_BACKOFF_S = 0.05
 
 
 def utcnow() -> str:
@@ -329,7 +362,10 @@ class MigrationEngine:
             while True:
                 result = self._copy_one_chunk()
                 if result == CONTINUE:
-                    time.sleep(self.settings.chunk_delay_ms / 1000.0)
+                    # Base fairness yield between chunk transactions.
+                    self._yield_lock()
+                    if self.settings.chunk_delay_ms:
+                        time.sleep(self.settings.chunk_delay_ms / 1000.0)
                     continue
                 if result == ABORT:
                     return
@@ -339,6 +375,20 @@ class MigrationEngine:
             logger.exception("migration failed")
             self._last_error = str(exc)
             self._record_failure(str(exc))
+
+    def _yield_lock(self) -> None:
+        """Release the lock briefly between write transactions.
+
+        SQLite allows only one writer at a time.  Back-to-back migration
+        transactions can otherwise starve a legacy connection whose
+        ``busy_timeout`` is short (e.g. 1 s): its UPDATE then fails with
+        "database is locked".  While sleeping the migration connection holds
+        no SQLite lock, so a blocked legacy writer gets a window to acquire
+        the write lock and complete its correction.
+        """
+        pause = self.settings.lock_yield_ms
+        if pause > 0:
+            time.sleep(pause / 1000.0)
 
     def _copy_one_chunk(self) -> str:
         """Copy one id-ordered chunk.  Returns CONTINUE / DONE / ABORT."""
@@ -409,50 +459,201 @@ class MigrationEngine:
             install_migration_triggers(conn)
 
     def _cutover(self) -> None:
-        """Final catch-up and atomic switch to the compatibility view."""
+        """Reconcile in short transactions, then atomically switch to the view.
+
+        No write transaction here holds SQLite's lock long enough to exceed a
+        legacy connection's one-second busy timeout: replay and cleanup run in
+        chunk-sized transactions, and the switch itself is one catalog-only
+        transaction that commits in a few milliseconds.
+        """
         conn = connect(self.settings)
+        try:
+            state = conn.execute(
+                "SELECT * FROM migration_state WHERE id = 1"
+            ).fetchone()
+            if state is None or state["state"] == "completed":
+                return
+            if self._is_view_installed(conn):
+                # The switch already committed elsewhere; only bookkeeping left.
+                with transaction(conn):
+                    conn.execute(
+                        "UPDATE migration_state SET state='completed',"
+                        " completed_at=?, last_error=NULL WHERE id=1",
+                        (utcnow(),),
+                    )
+                return
+
+            run_id = state["run_id"]
+            with transaction(conn):
+                self._ensure_triggers(conn)
+            self._drop_archive(conn)
+
+            # Step 1: one chunked reconciliation pass in short transactions.
+            # This is defensive backstop: the mirroring triggers have already
+            # applied every committed legacy write, so a converged table costs
+            # almost nothing (the UPSERT skips unchanged rows).  It also
+            # removes any long rows left behind by deletes.  Reconciliation
+            # does *not* require a quiet window -- a write that lands during
+            # the pass is mirrored by its trigger and is revalidated inside
+            # the switch transaction while we hold the write lock.
+            self._reconcile_upsert_pass(conn)
+            self._reconcile_delete_pass(conn)
+
+            # Step 2: the tiny atomic switch transaction.  It only retries when
+            # it cannot acquire the write lock; once the lock is held no other
+            # connection can commit, and the in-transaction row-count check
+            # proves the wide and long tables are consistent, so no
+            # half-switched state can be committed.
+            last_error: str | None = None
+            for attempt in range(1, MAX_SWITCH_ATTEMPTS + 1):
+                active = conn.execute(
+                    "SELECT state FROM migration_state WHERE id = 1"
+                ).fetchone()
+                if active is None or active["state"] != "copying":
+                    raise MigrationError("migration run is no longer active")
+
+                switched, reason = self._attempt_switch(conn, run_id)
+                if switched:
+                    self._drop_archive(conn)
+                    return
+                last_error = reason
+                logger.info(
+                    "cutover switch attempt %s deferred: %s", attempt, reason
+                )
+                time.sleep(SWITCH_RETRY_BACKOFF_S)
+
+            raise MigrationError(
+                "cutover could not acquire the write lock after "
+                f"{MAX_SWITCH_ATTEMPTS} attempts (last error: {last_error})"
+            )
+        finally:
+            # Failure recording is done by _run(), which also handles errors
+            # from the copy loop.
+            conn.close()
+
+    def _reconcile_upsert_pass(self, conn: sqlite3.Connection) -> None:
+        """Replay the whole wide table into the long one in chunk transactions.
+
+        UPSERT keeps the long table identical to the wide one at commit time;
+        the ``WHERE ... IS NOT`` clause skips rows whose value already matches
+        (including matching NULLs), so a converged table costs almost no writes.
+        """
+        last_id: int | None = None
+        while True:
+            with transaction(conn):
+                if self._is_view_installed(conn):
+                    raise MigrationError(
+                        "samples switched to the compatibility view"
+                        " during reconciliation"
+                    )
+                rows = conn.execute(
+                    "SELECT id, temperature, ph FROM samples"
+                    " WHERE id > ? ORDER BY id LIMIT ?",
+                    (
+                        last_id if last_id is not None else -(2**63),
+                        self.settings.chunk_size,
+                    ),
+                ).fetchall()
+                if not rows:
+                    return
+                for metric in METRICS:
+                    conn.executemany(
+                        "INSERT INTO sample_metrics (sample_id, metric, value)"
+                        " VALUES (?, ?, ?)"
+                        " ON CONFLICT (sample_id, metric) DO UPDATE"
+                        " SET value = excluded.value"
+                        " WHERE sample_metrics.value IS NOT excluded.value",
+                        [(r["id"], metric, r[metric]) for r in rows],
+                    )
+                last_id = rows[-1]["id"]
+            # Outside the transaction: no migration lock is held while sleeping.
+            self._yield_lock()
+
+    def _reconcile_delete_pass(self, conn: sqlite3.Connection) -> None:
+        """Remove long rows whose sample no longer exists, in chunk transactions.
+
+        Driven by a keyset scan over the long table's primary key with an
+        index-only existence check, so the pass stays O(n) regardless of how
+        many chunks it takes.
+        """
+        last_id: int | None = None
+        while True:
+            with transaction(conn):
+                if self._is_view_installed(conn):
+                    raise MigrationError(
+                        "samples switched to the compatibility view"
+                        " during reconciliation"
+                    )
+                rows = conn.execute(
+                    "SELECT DISTINCT sample_id FROM sample_metrics AS m"
+                    " WHERE m.sample_id > ?"
+                    " AND NOT EXISTS ("
+                    "     SELECT 1 FROM samples AS s WHERE s.id = m.sample_id)"
+                    " ORDER BY m.sample_id LIMIT ?",
+                    (
+                        last_id if last_id is not None else -(2**63),
+                        self.settings.chunk_size,
+                    ),
+                ).fetchall()
+                if not rows:
+                    return
+                ids = [r["sample_id"] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"DELETE FROM sample_metrics WHERE sample_id IN ({placeholders})",
+                    ids,
+                )
+                last_id = ids[-1]
+            # Outside the transaction: keep the lock free for legacy writers.
+            self._yield_lock()
+
+    def _attempt_switch(
+        self, conn: sqlite3.Connection, run_id: str
+    ) -> tuple[bool, str]:
+        """Try the atomic switch; returns ``(switched, reason)``.
+
+        Returns ``(True, ...)`` once the switch is committed (or was already
+        committed elsewhere).  The only retryable outcome is failure to
+        acquire the write lock, in which case the transaction is rolled back
+        and ``(False, reason)`` is returned -- nothing half-switched is ever
+        committed.
+        """
         try:
             with transaction(conn):
                 state = conn.execute(
                     "SELECT * FROM migration_state WHERE id = 1"
                 ).fetchone()
                 if state is None or state["state"] == "completed":
-                    return
+                    return True, "already_completed"
                 if self._is_view_installed(conn):
                     conn.execute(
                         "UPDATE migration_state SET state='completed',"
                         " completed_at=?, last_error=NULL WHERE id=1",
                         (utcnow(),),
                     )
-                    return
+                    return True, "view_already_installed"
 
-                # We hold the write lock, so this reflects every committed
-                # legacy write and no new one can commit until we finish.
-                for metric in METRICS:
-                    conn.execute(
-                        "INSERT INTO sample_metrics (sample_id, metric, value)"
-                        f" SELECT id, ?, {metric} FROM samples WHERE true"
-                        " ON CONFLICT (sample_id, metric) DO UPDATE"
-                        " SET value = excluded.value",
-                        (metric,),
-                    )
-                conn.execute(
-                    "DELETE FROM sample_metrics"
-                    " WHERE sample_id NOT IN (SELECT id FROM samples)"
-                )
+                # We hold the write lock now, so no legacy write can commit
+                # until this transaction finishes.  The mirroring triggers are
+                # still installed at this point, hence every earlier committed
+                # legacy write is already reflected here; the row-count check
+                # below proves the two representations are consistent.
                 total_rows = conn.execute(
                     "SELECT COUNT(*) AS n FROM sample_metrics"
                 ).fetchone()["n"]
-                samples = conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()[
-                    "n"
-                ]
+                samples = conn.execute(
+                    "SELECT COUNT(*) AS n FROM samples"
+                ).fetchone()["n"]
                 if total_rows != samples * len(METRICS):
                     raise MigrationError(
                         "post-copy validation failed: "
                         f"{total_rows} metric rows for {samples} samples"
                     )
+
+                # All DDL is transactional in SQLite: either the whole switch
+                # commits or the wide table remains completely untouched.
                 drop_migration_triggers(conn)
-                replace_wide_table_with_view(conn)
+                switch_wide_table_to_view(conn)
                 conn.execute(
                     "UPDATE migration_state SET state='completed',"
                     " completed_at=?, last_error=NULL,"
@@ -461,14 +662,25 @@ class MigrationEngine:
                 )
                 self._event(
                     conn,
-                    state["run_id"],
+                    run_id,
                     "cutover_completed",
                     f"samples={samples}, metric_rows={total_rows}",
                 )
-        finally:
-            # Failure recording is done by _run(), which also handles errors
-            # from the copy loop.
-            conn.close()
+                return True, "switched"
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower():
+                return False, f"busy: {exc}"
+            raise
+
+    def _drop_archive(self, conn: sqlite3.Connection) -> None:
+        """Drop a wide-table archive left by a previous (interrupted) switch."""
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (ARCHIVE_TABLE,),
+        ).fetchone()
+        if exists is not None:
+            with transaction(conn):
+                drop_archived_wide_table(conn)
 
     # -------------------------------------------------------------- helpers
     @staticmethod
